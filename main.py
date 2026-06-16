@@ -48,21 +48,7 @@ def parse_args():
     parser.add_argument('--workers', default=16, type=int)
     parser.add_argument('--multiprocessing_distributed', action='store_true')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--beta', default=1.0, type=float)
-    parser.add_argument('--confidence_gate', action='store_true')
-    parser.add_argument('--tau_max', default=0.7, type=float)
-    parser.add_argument('--tau_min', default=0.1, type=float)
-    parser.add_argument('--correct_gate', action='store_true')
-    parser.add_argument('--hard_gate', action='store_true')
-    parser.add_argument('--soft_weight', action='store_true')
-    parser.add_argument('--true_class_weight', action='store_true')
-    parser.add_argument('--tcw_b2_sigmoid', action='store_true',
-                        help='B2: sigmoid additive normalization for true_class_weight (refines v3)')
-    parser.add_argument('--b2_scale', default=10.0, type=float,
-                        help='B2 sigmoid scale factor: higher = sharper transition around w_running')
-    parser.add_argument('--b2_beta_min', default=0.1, type=float)
-    parser.add_argument('--b2_beta_max', default=1.0, type=float)
-    parser.add_argument('--warmup_epochs', default=10, type=int)
+    parser.add_argument('--beta', default=0.5, type=float)
     parser.add_argument('--seed', default=2024, type=int)
     args = parser.parse_args()
     random.seed(args.seed)
@@ -107,7 +93,7 @@ def accuracy(output, target, topk=(1,)):
         for k in topk:
             correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
-        return res    
+        return res
 C = Colorer.instance()
 def main():
     args = parse_args()
@@ -127,7 +113,7 @@ def main():
         print(C.green("[!] Multi/Single Node, Multi-GPU All multiprocessing_distributed Training Done."))
         print(C.underline(C.red2('[Info] Save Model dir:')), C.red2(model_dir))
         print(C.underline(C.red2('[Info] Log dir:')), C.red2(log_dir))
-        print(C.underline(C.red2('[Info] Config dir:')), C.red2(config_dir)) 
+        print(C.underline(C.red2('[Info] Config dir:')), C.red2(config_dir))
     else:
         print(C.green("[!] Multi/Single Node, Single-GPU per node, multiprocessing_distributed Training Done."))
         main_worker(0, ngpus_per_node, model_dir, log_dir, args)
@@ -179,7 +165,6 @@ def main_worker(gpu, ngpus_per_node, model_dir, log_dir, args):
     scaler = GradScaler()
     all_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
     now_predictions = torch.zeros(len(train_loader.dataset), len(train_loader.dataset.classes), dtype=torch.float32)
-    w_running = 0.1  # EMA of mean(true_class_prob) across batches — used by true_class_weight v4
     print(C.underline(C.yellow("[Info] all_predictions matrix shape {}".format(all_predictions.shape))))
     if args.resume:
         if args.gpu is None:
@@ -189,7 +174,7 @@ def main_worker(gpu, ngpus_per_node, model_dir, log_dir, args):
                 dist.barrier()
             loc = 'cuda:{}'.format(args.gpu)
             checkpoint = torch.load(args.resume, map_location=loc)
-        args.start_epoch = checkpoint['epoch'] + 1 
+        args.start_epoch = checkpoint['epoch'] + 1
         best_acc = checkpoint['best_acc']
         all_predictions = checkpoint['prev_predictions'].cpu()
         net.load_state_dict(checkpoint['net'])
@@ -200,7 +185,7 @@ def main_worker(gpu, ngpus_per_node, model_dir, log_dir, args):
         adjust_learning_rate(optimizer, epoch, args)
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        now_predictions, w_running = train(
+        now_predictions = train(
                                 all_predictions,
                                 now_predictions,
                                 criterion_CE,
@@ -210,8 +195,7 @@ def main_worker(gpu, ngpus_per_node, model_dir, log_dir, args):
                                 epoch,
                                 train_loader,
                                 args,
-                                scaler,
-                                w_running)
+                                scaler)
         if args.distributed:
             dist.barrier()
         acc = val(
@@ -252,8 +236,7 @@ def train(all_predictions,
           epoch,
           train_loader,
           args,
-          scaler,
-          w_running=0.1):
+          scaler):
     train_top1 = AverageMeter()
     train_top5 = AverageMeter()
     train_losses = AverageMeter()
@@ -261,10 +244,6 @@ def train(all_predictions,
     total = 0
     net.train()
     current_LR = get_learning_rate(optimizer)[0]
-    tau_t = args.tau_max - (args.tau_max - args.tau_min) * (epoch / max(args.end_epoch - 1, 1))
-    gate_pct_accum = 0.0
-    beta_eff_accum = 0.0
-    gate_batches = 0
     for batch_idx, (inputs, targets, input_indices) in enumerate(train_loader):
         optimizer.zero_grad()
         if args.gpu is not None:
@@ -318,97 +297,8 @@ def train(all_predictions,
                     now_predictions[idx] = (gathered_prediction[jdx].cpu().detach().float() * args.beta
                                             + now_predictions[idx] * (1 - args.beta))
             else:
-                # B2: tanh + per-batch rank normalization.
-                # Fix A (re-center): delta=0 → β_eff = args.beta (vanilla EMA-SKD), not 0.55.
-                # Fix B (rank): replace w_running EMA with per-batch rank — eliminates the
-                # saturation that flattened delta as w_running → 1.0 in the sigmoid variant.
-                if args.tcw_b2_sigmoid:
-                    logits = outputs_S.detach().float().cpu()
-                    probs = torch.softmax(logits, dim=1)
-                    w = probs[torch.arange(len(targets)), targets.cpu()]
-                    w_running = 0.9 * w_running + 0.1 * w.mean().item()  # logged only; unused in update
-                    if epoch < args.warmup_epochs:
-                        beta_eff = torch.full_like(w, args.beta)
-                    else:
-                        w_rank = w.argsort().argsort().float() / max(len(w) - 1, 1)  # [0, 1] per batch
-                        delta = w_rank - 0.5  # symmetric in [-0.5, 0.5]
-                        amplitude = 0.5 * (args.b2_beta_max - args.b2_beta_min)
-                        beta_eff = (args.beta + amplitude * torch.tanh(delta * args.b2_scale)).clamp(args.b2_beta_min, args.b2_beta_max)
-                    now_predictions[input_indices] = (
-                        logits * beta_eff.unsqueeze(1) +
-                        now_predictions[input_indices] * (1 - beta_eff.unsqueeze(1))
-                    )
-                    gate_pct_accum += (beta_eff >= args.b2_beta_max * 0.95).float().mean().item() * 100  # near-ceiling%
-                    beta_eff_accum += beta_eff.mean().item()
-                # true-class soft weight v4: EMA normalizer + warmup + capped w_norm + floor.
-                # R1: running EMA of mean(w) replaces per-batch normalization.
-                # R2: warmup epochs use flat beta — protects one-hot init from ep0 overwrite.
-                # R3: clamp w_norm ≤ 2.0 before scaling → mean(beta_eff) ≈ beta always.
-                # R4: log actual clamp rate and mean(beta_eff) for diagnosis.
-                elif args.true_class_weight:
-                    logits = outputs_S.detach().float().cpu()
-                    probs = torch.softmax(logits, dim=1)  # for weight computation only
-                    w = probs[torch.arange(len(targets)), targets.cpu()]  # prob at true class [B]
-                    w_running = 0.9 * w_running + 0.1 * w.mean().item()  # R1: EMA normalizer
-                    if epoch < args.warmup_epochs:
-                        beta_eff = torch.full_like(w, args.beta)          # R2: flat warmup
-                    else:
-                        w_norm = (w / max(w_running, 1e-3)).clamp(max=2.0)  # R3: capped w_norm
-                        beta_eff = (args.beta * w_norm).clamp(min=0.1, max=1.0)
-                    now_predictions[input_indices] = (
-                        logits * beta_eff.unsqueeze(1) +
-                        now_predictions[input_indices] * (1 - beta_eff.unsqueeze(1))
-                    )
-                    gate_pct_accum += (beta_eff >= 1.0).float().mean().item() * 100  # R4: clamp%
-                    beta_eff_accum += beta_eff.mean().item()                          # R4: mean β_eff
-                # soft weighting: scale per-sample EMA update speed by prediction confidence.
-                # NOTE: pre-fix results (ECE~31) were due to softmax-in-bank bug; not yet re-tested.
-                elif args.soft_weight:
-                    logits = outputs_S.detach().float().cpu()
-                    probs = torch.softmax(logits, dim=1)  # for weight computation only
-                    C = probs.size(1)
-                    w = ((probs.max(dim=1).values - 1.0 / C) / (1.0 - 1.0 / C)).clamp(min=0)
-                    beta_eff = args.beta * w                          # shape [B]
-                    now_predictions[input_indices] = (
-                        logits * beta_eff.unsqueeze(1) +
-                        now_predictions[input_indices] * (1 - beta_eff.unsqueeze(1))
-                    )
-                    gate_pct_accum += w.mean().item() * 100           # avg weight as proxy
-                # correct-prediction gate: only update memory bank when model predicts correctly.
-                # NOTE: pre-fix results (ECE~34) were due to softmax-in-bank bug; not yet re-tested.
-                elif args.correct_gate:
-                    logits = outputs_S.detach().float().cpu()
-                    probs = torch.softmax(logits, dim=1)  # for mask computation only
-                    _, predicted = torch.max(outputs_S, 1)
-                    mask = (predicted.cpu() == targets.cpu())
-                    idx  = input_indices[mask]
-                    now_predictions[idx] = logits[mask] * args.beta + now_predictions[idx] * (1 - args.beta)
-                    gate_pct_accum += mask.float().mean().item() * 100
-                # hard gate: update only when model predicts correctly AND confidence > tau_t.
-                # Combines correct_gate + confidence_gate — strictest filter, no soft weighting.
-                elif args.hard_gate:
-                    logits = outputs_S.detach().float().cpu()
-                    probs = torch.softmax(logits, dim=1)
-                    _, predicted = torch.max(outputs_S, 1)
-                    correct_mask = (predicted.cpu() == targets.cpu())
-                    conf_mask = probs.max(dim=1).values > tau_t
-                    mask = correct_mask & conf_mask
-                    idx = input_indices[mask]
-                    now_predictions[idx] = logits[mask] * args.beta + now_predictions[idx] * (1 - args.beta)
-                    gate_pct_accum += mask.float().mean().item() * 100
-                # confidence gate: update only when max softmax > tau_t (linearly decayed).
-                # NOTE: pre-fix results (ECE~27) were due to softmax-in-bank bug; not yet re-tested.
-                elif args.confidence_gate:
-                    logits = outputs_S.detach().float().cpu()
-                    probs = torch.softmax(logits, dim=1)  # for mask computation only
-                    mask  = probs.max(dim=1).values > tau_t
-                    idx   = input_indices[mask]
-                    now_predictions[idx] = logits[mask] * args.beta + now_predictions[idx] * (1 - args.beta)
-                    gate_pct_accum += mask.float().mean().item() * 100
-                else:
-                    now_predictions[input_indices] = outputs_S.detach().float().cpu() * args.beta + now_predictions[input_indices] * (1 - args.beta)
-                    gate_pct_accum += 100.0
-                gate_batches += 1
+                now_predictions[input_indices] = (outputs_S.detach().float().cpu() * args.beta
+                                                  + now_predictions[input_indices] * (1 - args.beta))
         progress_bar(epoch,batch_idx, len(train_loader), args, 'lr: {:.1e} |  loss: {:.3f} | top1_acc: {:.3f} | top5_acc: {:.3f} | correct/total({}/{})'.format(
             current_LR, train_losses.avg, train_top1.avg, train_top5.avg, correct, total))
     if args.distributed:
@@ -419,9 +309,7 @@ def train(all_predictions,
             now_predictions = now_preds_gpu.cpu()
     if is_main_process():
         logger = logging.getLogger('train')
-        gate_pct = gate_pct_accum / max(gate_batches, 1)
-        beta_eff_mean = beta_eff_accum / max(gate_batches, 1)
-        logger.info('[Epoch {}] [EHSKD {}] [lr {:.1e}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}] [correct/total {}/{}] [gate {:.1f}%] [tau {:.3f}] [beta_eff {:.3f}] [w_run {:.3f}]'.format(
+        logger.info('[Epoch {}] [EHSKD {}] [lr {:.1e}] [train_loss {:.3f}] [train_top1_acc {:.3f}] [train_top5_acc {:.3f}] [correct/total {}/{}]'.format(
             epoch,
             args.EHSKD,
             current_LR,
@@ -429,12 +317,8 @@ def train(all_predictions,
             train_top1.avg,
             train_top5.avg,
             correct,
-            total,
-            gate_pct,
-            tau_t,
-            beta_eff_mean,
-            w_running))
-    return now_predictions, w_running
+            total))
+    return now_predictions
 def val(criterion_CE,
         net,
         epoch,
@@ -449,7 +333,7 @@ def val(criterion_CE,
     correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets, _) in enumerate(val_loader):              
+        for batch_idx, (inputs, targets, _) in enumerate(val_loader):
             if args.gpu is not None:
                 inputs = inputs.cuda(args.gpu, non_blocking=True)
                 targets = targets.cuda(args.gpu, non_blocking=True)
